@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How Integrated Gradients flows through a neural network</title>
+<style>
+  :root{
+    --bg:#faf9f5; --surface:#ffffff; --card:#f3f1ea; --border:#e0ded4;
+    --text:#28271f; --muted:#6b6a62; --hint:#93928a;
+    --purple:#534AB7; --blue:#185FA5; --coral:#993C1D; --teal:#0F6E56;
+    --teal-mid:#1D9E75; --amber:#B8791B; --red:#A5321D;
+    --font:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:"SF Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#22221e; --surface:#2c2c27; --card:#33332d; --border:#45443d;
+      --text:#e9e7dd; --muted:#a9a89f; --hint:#79786f; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font);
+    line-height:1.55;padding:28px 18px;}
+  .wrap{max-width:860px;margin:0 auto;}
+  h1{font-size:23px;font-weight:600;margin:0 0 4px;}
+  .sub{color:var(--muted);font-size:14px;margin:0 0 20px;}
+  .stage{background:var(--surface);border:1px solid var(--border);border-radius:16px;
+    padding:14px;margin-bottom:16px;}
+  svg{width:100%;height:auto;display:block;}
+  .controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;}
+  button{font-family:var(--font);font-size:14px;padding:9px 16px;border-radius:9px;
+    border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;
+    transition:border-color .15s;}
+  button:hover{border-color:var(--muted);}
+  button.primary{background:var(--teal);color:#fff;border-color:var(--teal);}
+  button:disabled{opacity:.4;cursor:not-allowed;}
+  .steplabel{font-size:13px;color:var(--muted);font-family:var(--mono);margin-left:auto;}
+  .phasebar{display:flex;gap:4px;margin-bottom:14px;flex-wrap:wrap;}
+  .phasebar .p{flex:1;min-width:80px;text-align:center;font-size:11px;padding:6px 4px;
+    border-radius:7px;background:var(--card);color:var(--hint);border:1px solid transparent;}
+  .phasebar .p.active{background:var(--teal);color:#fff;font-weight:600;}
+  .phasebar .p.done{color:var(--teal);border-color:var(--teal);}
+  .explain{background:var(--card);border-radius:11px;padding:14px 16px;min-height:76px;font-size:14.5px;}
+  .explain b{color:var(--text);}
+  .explain .eq{font-family:var(--mono);font-size:13px;background:var(--surface);
+    padding:8px 10px;border-radius:7px;margin-top:8px;display:inline-block;color:var(--text);}
+  code{font-family:var(--mono);background:var(--card);padding:1px 5px;border-radius:4px;font-size:13px;}
+  .fnote{font-size:12.5px;color:var(--hint);margin-top:14px;line-height:1.55;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Integrated Gradients, flowing through a network</h1>
+  <p class="sub">Step through the full IG computation: baseline &amp; input → interpolate the path → forward pass through F → backward pass (gradients) → average → attribution.</p>
+
+  <div class="phasebar" id="phasebar">
+    <div class="p" data-p="0">1 · baseline &amp; input</div>
+    <div class="p" data-p="1">2 · interpolate</div>
+    <div class="p" data-p="2">3 · forward through F</div>
+    <div class="p" data-p="3">4 · backward (grad)</div>
+    <div class="p" data-p="4">5 · average</div>
+    <div class="p" data-p="5">6 · attribution</div>
+  </div>
+
+  <div class="controls">
+    <button id="prev">‹ Back</button>
+    <button id="play" class="primary">▶ Play</button>
+    <button id="next">Next ›</button>
+    <button id="reset">Reset</button>
+    <span class="steplabel" id="steplabel">step 1 / 6</span>
+  </div>
+
+  <div class="stage">
+    <svg viewBox="0 0 860 430" role="img" id="ig-svg" aria-label="Animated diagram of Integrated Gradients flowing through a neural network">
+      <defs>
+        <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+          <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        </marker>
+      </defs>
+
+      <!-- FEATURE SPACE PANEL (left) -->
+      <text x="20" y="26" font-size="12" font-weight="600" fill="var(--muted)">feature space</text>
+      <rect x="20" y="34" width="220" height="200" rx="10" fill="var(--card)" stroke="var(--border)" stroke-width="1"/>
+      <!-- axes hint -->
+      <text x="130" y="252" font-size="10.5" fill="var(--hint)" text-anchor="middle">feature 1</text>
+      <text x="12" y="134" font-size="10.5" fill="var(--hint)" text-anchor="middle" transform="rotate(-90 12 134)">feature 2</text>
+
+      <!-- baseline & input points (set in JS) -->
+      <line id="path" x1="70" y1="200" x2="190" y2="70" stroke="var(--purple)" stroke-width="2" stroke-dasharray="5 5" opacity="0"/>
+      <circle id="pt-base" cx="70" cy="200" r="8" fill="var(--blue)" stroke="var(--surface)" stroke-width="2" opacity="0"/>
+      <circle id="pt-input" cx="190" cy="70" r="8" fill="var(--coral)" stroke="var(--surface)" stroke-width="2" opacity="0"/>
+      <text id="lbl-base" x="70" y="222" font-size="11" fill="var(--blue)" text-anchor="middle" opacity="0">baseline x′</text>
+      <text id="lbl-input" x="190" y="60" font-size="11" fill="var(--coral)" text-anchor="middle" opacity="0">input x</text>
+      <g id="interp-pts"></g>
+
+      <!-- NETWORK PANEL (center) -->
+      <text x="300" y="26" font-size="12" font-weight="600" fill="var(--muted)">the network  F</text>
+      <g id="network"></g>
+      <text id="net-in" x="300" y="410" font-size="10.5" fill="var(--hint)" text-anchor="middle">input (D features)</text>
+      <text id="net-out" x="660" y="410" font-size="10.5" fill="var(--hint)" text-anchor="middle">output F</text>
+
+      <!-- flow arrow labels -->
+      <text id="flow-label" x="480" y="26" font-size="12" font-weight="600" fill="var(--teal)" text-anchor="middle" opacity="0">forward pass →</text>
+
+      <!-- RESULT PANEL (right) -->
+      <text x="720" y="26" font-size="12" font-weight="600" fill="var(--muted)">attribution</text>
+      <g id="result"></g>
+    </svg>
+  </div>
+
+  <div class="explain" id="explain"></div>
+
+  <p class="fnote" id="fnote"></p>
+</div>
+
+<script>
+const svgNS="http://www.w3.org/2000/svg";
+const el = id => document.getElementById(id);
+
+// ---- network geometry: input(4) -> hidden(5) -> hidden(4) -> output(1) ----
+const layers = [
+  {n:4, x:300, label:"x"},
+  {n:5, x:420, label:"h₁"},
+  {n:4, x:540, label:"h₂"},
+  {n:1, x:660, label:"F"}
+];
+const yTop=60, yBot=380;
+function nodeY(count, i){ if(count===1) return (yTop+yBot)/2; return yTop + i*(yBot-yTop)/(count-1); }
+
+const netG = el('network');
+let nodeEls=[], edgeEls=[];
+// edges first (behind)
+for(let l=0;l<layers.length-1;l++){
+  for(let i=0;i<layers[l].n;i++){
+    for(let j=0;j<layers[l+1].n;j++){
+      const line=document.createElementNS(svgNS,'line');
+      line.setAttribute('x1',layers[l].x); line.setAttribute('y1',nodeY(layers[l].n,i));
+      line.setAttribute('x2',layers[l+1].x); line.setAttribute('y2',nodeY(layers[l+1].n,j));
+      line.setAttribute('stroke','var(--border)'); line.setAttribute('stroke-width','1');
+      line.dataset.l=l;
+      netG.appendChild(line); edgeEls.push(line);
+    }
+  }
+}
+// nodes
+for(let l=0;l<layers.length;l++){
+  nodeEls[l]=[];
+  for(let i=0;i<layers[l].n;i++){
+    const c=document.createElementNS(svgNS,'circle');
+    c.setAttribute('cx',layers[l].x); c.setAttribute('cy',nodeY(layers[l].n,i));
+    c.setAttribute('r',13); c.setAttribute('fill','var(--surface)');
+    c.setAttribute('stroke','var(--muted)'); c.setAttribute('stroke-width','1.5');
+    netG.appendChild(c); nodeEls[l].push(c);
+  }
+  const t=document.createElementNS(svgNS,'text');
+  t.setAttribute('x',layers[l].x); t.setAttribute('y',44);
+  t.setAttribute('font-size','11'); t.setAttribute('fill','var(--muted)');
+  t.setAttribute('text-anchor','middle'); t.textContent=layers[l].label;
+  netG.appendChild(t);
+}
+// layer-type captions under hidden layers
+const caps=[["Linear→BN",420],["SiLU→Linear",540]];
+// (kept light; explained in text)
+
+// ---- interpolated points in feature space ----
+const bx=70, by=200, ix=190, iy=70;   // baseline & input coords in the panel
+const interpG=el('interp-pts');
+let interpDots=[];
+for(let k=1;k<=5;k++){
+  const t=k/6;
+  const cx=bx+t*(ix-bx), cy=by+t*(iy-by);
+  const d=document.createElementNS(svgNS,'circle');
+  d.setAttribute('cx',cx); d.setAttribute('cy',cy); d.setAttribute('r',5);
+  d.setAttribute('fill','var(--teal-mid)'); d.setAttribute('opacity','0');
+  interpG.appendChild(d); interpDots.push(d);
+}
+
+// ---- result bars ----
+const resG=el('result');
+const featNames=["f₁","f₂","f₃","f₄"];
+const attrVals=[0.42,0.11,-0.18,0.30];   // illustrative signed attributions
+let resBars=[];
+for(let i=0;i<4;i++){
+  const y=70+i*44;
+  const g=document.createElementNS(svgNS,'g'); g.setAttribute('opacity','0');
+  const lbl=document.createElementNS(svgNS,'text');
+  lbl.setAttribute('x',720); lbl.setAttribute('y',y+4); lbl.setAttribute('font-size','11');
+  lbl.setAttribute('fill','var(--muted)'); lbl.textContent=featNames[i];
+  const bar=document.createElementNS(svgNS,'rect');
+  const w=Math.abs(attrVals[i])*150;
+  bar.setAttribute('x',740); bar.setAttribute('y',y-9); bar.setAttribute('height',16);
+  bar.setAttribute('width',0); bar.dataset.w=w;
+  bar.setAttribute('fill', attrVals[i]>=0 ? 'var(--teal-mid)' : 'var(--amber)');
+  bar.setAttribute('rx',3);
+  g.appendChild(lbl); g.appendChild(bar); resG.appendChild(g); resBars.push({g,bar});
+}
+
+// ---- helpers ----
+function setOpacity(node,o,dur=350){ node.style.transition=`opacity ${dur}ms`; node.style.opacity=o; }
+function resetNodes(){
+  nodeEls.flat().forEach(c=>{ c.setAttribute('fill','var(--surface)'); c.setAttribute('stroke','var(--muted)'); c.setAttribute('stroke-width','1.5'); });
+  edgeEls.forEach(e=>{ e.setAttribute('stroke','var(--border)'); e.setAttribute('stroke-width','1'); });
+}
+function lightLayer(l,color,forward=true){
+  nodeEls[l].forEach(c=>{
+    c.setAttribute('fill',color); c.setAttribute('stroke',color);
+  });
+}
+function lightEdges(l,color){
+  edgeEls.filter(e=>+e.dataset.l===l).forEach(e=>{ e.setAttribute('stroke',color); e.setAttribute('stroke-width','1.8'); });
+}
+
+// ---- phase definitions ----
+const explains=[
+ // 0
+ `<b>Start: two points.</b> We have a trained network F. Pick a <span style="color:var(--coral)">signal event x</span> (what we want to explain) and a <span style="color:var(--blue)">baseline x′</span> (the "reference" — here a background event). IG will explain x <i>relative to</i> x′.
+  <div class="eq">IG answers: which features make x different from x′, according to F?</div>`,
+ // 1
+ `<b>Interpolate the path.</b> Lay down <b>m</b> points on the straight line from x′ to x: &nbsp;<code>x′ + (k/m)(x − x′)</code>&nbsp; for k = 1…m. These are the points where we will sample the network's gradient. (m ≈ 20–300 in practice.)
+  <div class="eq">γ(t) = x′ + t·(x − x′),&nbsp; t ∈ [0,1]</div>`,
+ // 2
+ `<b>Forward pass through F.</b> Push each interpolated point through the network. Signal flows <b>left → right</b>: input → Linear+BatchNorm → SiLU → Linear+BatchNorm → SiLU → output. Each hidden node computes its activation. This is just <code>model(path)</code>.
+  <div class="eq">h₁ = SiLU(BN(W₁x+b₁)),&nbsp; h₂ = SiLU(BN(W₂h₁+b₂)),&nbsp; F = W₃h₂+b₃</div>`,
+ // 3
+ `<b>Backward pass — the gradient.</b> Now flow <b>right → left</b>: compute ∂F/∂x at each point by the <b>chain rule</b>, multiplying each layer's local derivative back through the hidden layers. Autograd (<code>torch.autograd.grad</code>) does this. SiLU is smooth so its derivative is well-defined everywhere; eval-mode BatchNorm/Dropout are just constants.
+  <div class="eq">∂F/∂xᵢ = (∂F/∂h₂)(∂h₂/∂h₁)(∂h₁/∂xᵢ)</div>`,
+ // 4
+ `<b>Average the gradients.</b> We now have one gradient vector per path point. Average them along the path — this is the Riemann sum approximating the integral. Averaging over the whole path (not just at x) is what cures gradient <i>saturation</i>.
+  <div class="eq">avg_grad = (1/m) Σₖ ∂F/∂x at point k</div>`,
+ // 5
+ `<b>The attribution.</b> Multiply the averaged gradient by the displacement <code>(x − x′)</code>, element-wise. That gives one number per feature: its contribution. <span style="color:var(--teal-mid)">Green = pushes toward signal</span>, <span style="color:var(--amber)">amber = toward background</span>. They sum to F(x) − F(x′) — the <b>completeness</b> axiom.
+  <div class="eq">IGᵢ = (xᵢ − x′ᵢ) · avg_gradᵢ &nbsp;&nbsp;→&nbsp;&nbsp; Σ IGᵢ = F(x) − F(x′)</div>`
+];
+const fnotes=[
+ "In your notebook this whole 6-step sequence is the single line ig.attribute(signal, baselines=baseline, n_steps=20).",
+ "The number of interpolated points is n_steps in Captum. More steps = closer to the true integral; check completeness and raise it if the sum doesn't match F(x)−F(x′).",
+ "model.eval() is set before this so Dropout is identity and BatchNorm uses fixed running stats — otherwise the forward pass (and gradient) would depend on the batch.",
+ "This backward step is exactly one call to torch.autograd.grad(outputs=F.sum(), inputs=path). PyTorch multiplies the per-layer chain-rule factors automatically.",
+ "For the background-ensemble baseline, steps 1–5 are repeated for many baselines x′ and the resulting attributions are averaged — the outer loop in the notebook.",
+ "Because attributions sum to F(x)−F(x′), you can rank features by magnitude and trust the total is fully accounted for. That's why the notebook can rank them meaningfully."
+];
+
+let phase=0;
+const N=6;
+
+function render(){
+  // phase bar
+  document.querySelectorAll('#phasebar .p').forEach(p=>{
+    const pi=+p.dataset.p;
+    p.classList.toggle('active', pi===phase);
+    p.classList.toggle('done', pi<phase);
+  });
+  el('steplabel').textContent=`step ${phase+1} / ${N}`;
+  el('explain').innerHTML=explains[phase];
+  el('fnote').textContent=fnotes[phase];
+  el('prev').disabled = phase===0;
+  el('next').disabled = phase===N-1;
+
+  // reset visual layers each render, then apply cumulative state
+  resetNodes();
+  // base/input always visible from phase 0
+  const showBaseInput = phase>=0;
+  setOpacity(el('pt-base'), showBaseInput?1:0);
+  setOpacity(el('pt-input'), showBaseInput?1:0);
+  setOpacity(el('lbl-base'), showBaseInput?1:0);
+  setOpacity(el('lbl-input'), showBaseInput?1:0);
+
+  // path + interp dots from phase 1
+  setOpacity(el('path'), phase>=1?1:0);
+  interpDots.forEach((d,k)=> setOpacity(d, phase>=1?1:0, 300));
+
+  // flow label
+  const fl=el('flow-label');
+  if(phase===2){ fl.textContent="forward pass →"; fl.setAttribute('fill','var(--teal)'); setOpacity(fl,1); }
+  else if(phase===3){ fl.textContent="← backward pass (∂F/∂x)"; fl.setAttribute('fill','var(--red)'); setOpacity(fl,1); }
+  else setOpacity(fl,0);
+
+  // network colouring
+  if(phase===2){ // forward: light all layers greenish
+    for(let l=0;l<layers.length;l++){ lightLayer(l,'var(--teal-mid)'); if(l<layers.length-1) lightEdges(l,'var(--teal-mid)'); }
+  } else if(phase===3){ // backward: light red, right to left emphasis
+    for(let l=0;l<layers.length;l++){ lightLayer(l,'var(--red)'); if(l<layers.length-1) lightEdges(l,'var(--red)'); }
+  } else if(phase>=2){ // keep network "engaged" look
+    for(let l=0;l<layers.length;l++){ lightLayer(l,'var(--muted)'); }
+  }
+
+  // result bars from phase 5
+  resBars.forEach(rb=>{
+    setOpacity(rb.g, phase>=5?1:0);
+    rb.bar.style.transition='width 600ms';
+    rb.bar.setAttribute('width', phase>=5 ? rb.bar.dataset.w : 0);
+  });
+}
+
+// forward/backward pulse animation when entering phase 2 or 3
+let pulseTimer=null;
+function pulse(direction){
+  clearInterval(pulseTimer);
+  const order = direction==='fwd' ? [0,1,2,3] : [3,2,1,0];
+  let step=0;
+  const color = direction==='fwd' ? 'var(--teal)' : 'var(--red)';
+  pulseTimer=setInterval(()=>{
+    resetNodes();
+    // keep everything base-lit
+    for(let l=0;l<layers.length;l++) lightLayer(l, direction==='fwd'?'var(--teal-mid)':'var(--red)');
+    const l=order[step];
+    nodeEls[l].forEach(c=>{ c.setAttribute('r',16); c.setAttribute('stroke-width','3'); });
+    setTimeout(()=>nodeEls[l].forEach(c=>c.setAttribute('r',13)),260);
+    if(l<layers.length-1 && direction==='fwd') lightEdges(l,color);
+    if(l>0 && direction==='bwd') lightEdges(l-1,color);
+    step++;
+    if(step>=order.length){ clearInterval(pulseTimer); }
+  },300);
+}
+
+function go(p){
+  phase=Math.max(0,Math.min(N-1,p));
+  render();
+  if(phase===2) pulse('fwd');
+  if(phase===3) pulse('bwd');
+}
+
+el('next').onclick=()=>go(phase+1);
+el('prev').onclick=()=>go(phase-1);
+el('reset').onclick=()=>{ stopPlay(); go(0); };
+
+let playTimer=null;
+function stopPlay(){ clearInterval(playTimer); playTimer=null; el('play').textContent='▶ Play'; }
+el('play').onclick=function(){
+  if(playTimer){ stopPlay(); return; }
+  this.textContent='⏸ Pause';
+  if(phase===N-1) go(0);
+  playTimer=setInterval(()=>{
+    if(phase>=N-1){ stopPlay(); return; }
+    go(phase+1);
+  },2600);
+};
+
+go(0);
+</script>
+</body>
+</html>
